@@ -3,14 +3,14 @@
 "1.1.1");
 
   /* ══════════════════════════════════════════════════════════════════
-     EO Asset Script Activity  (v4 — Full Overwrite)
+     EO Asset Script Activity  (v5 — Text Extract)
      ────────────────────────────────────────────────────────────────
-     CHANGES IN v4:
-       1. Removed 24-hour cutoff — fetches ALL matching assets.
-       2. Clears the Data DE before inserting, so every run is a
-          full overwrite (avoids duplicate primary-key errors).
-       3. Search pattern changed to "Message_Cente" (prefix match).
-       4. Uses Rows.Add() for inserts after the DE is cleared.
+     CHANGES IN v5:
+       1. Extracts PLAIN TEXT instead of HTML content.
+       2. Checks views.text.content first (SFMC native text view).
+       3. Falls back to stripping HTML tags if text view is absent.
+       4. WSProxy fallback uses TextBody instead of HTMLBody.
+       5. stripHtmlToText() helper converts HTML → readable plain text.
      ────────────────────────────────────────────────────────────────
      PREREQUISITES:
        - All non-PK fields in the Log DE MUST be Nullable.
@@ -37,7 +37,7 @@
   var PAGE_SIZE      = 50;
 
   /* ── Log counter for unique IDs ────────────────────────────────── */
-  var logCounter  = 0;
+  var logCounter   = 0;
   var runTimestamp = Now();
 
   /* Simple run ID from timestamp */
@@ -77,36 +77,157 @@
     });
 }
 /* ── Helper: insert a row into the Data DE ──────────────────────── */
-/* Uses DataExtension.Init(ExternalKey).Rows.Add() to insert a new row.
-     The DE is cleared at the start of each run, so we only INSERT.
-
-     12,000 CHAR SUPPORT:
-       The "Content" field MUST be created in Email Studio with a BLANK
-       length so it becomes nvarchar(max).  Do NOT edit it in Contact
-       Builder afterwards — CB enforces a 4,000-char cap.              */
-  function insertAsset(assetName, assetId, customerKey, subject, contentHtml) {
+  function insertAsset(assetName, assetId, customerKey, subject, contentText) {
     var dataDE = DataExtension.Init(DE_DATA_EXTKEY);
     dataDE.Rows.Add({
       Asset_Name:        assetName   || "N/A",
       Asset_ID:          assetId     || "N/A",
       Customer_Key:      customerKey || "N/A",
       Subject:           subject     || "N/A",
-      Content:           contentHtml || "N/A",
+      Content:           contentText || "N/A",
       Last_Updated_Date: Now()
     });
 }
-/* ── Helper: strip unwanted HTML entities from extracted content ── */
-  function cleanHtmlEntities(html) {
-    if (!html) return html;
-    html = html.split("&nbsp;").join(" ");
-    html = html.split("&ldquo;").join('"');
-    html = html.split("&rdquo;").join('"');
-    html = html.split("&lsquo;").join("'");
-    html = html.split("&rsquo;").join("'");
-    html = html.split("&mdash;").join("—");
-    html = html.split("&ndash;").join("–");
-    html = html.split("&hellip;").join("...");
-    return html;
+/* ══════════════════════════════════════════════════════════════════
+     Helper: stripHtmlToText(html)
+     ────────────────────────────────────────────────────────────────
+     Converts an HTML string into readable plain text by:
+       1. Replacing block-level tags with newlines for readability.
+       2. Replacing <br> variants with a single newline.
+       3. Removing all remaining HTML tags.
+       4. Decoding common HTML entities.
+       5. Collapsing excessive whitespace and blank lines.
+  ══════════════════════════════════════════════════════════════════ */
+  function stripHtmlToText(html) {
+    if (!html) return "";
+
+    var text = html;
+
+    /* ── 1. Replace block-level elements with newlines ─────────────
+       Process these BEFORE stripping tags so structure is preserved. */
+    /* Paragraph / div / section end → double newline */
+    text = text.split("</p>").join("\n\n");
+    text = text.split("</P>").join("\n\n");
+    text = text.split("</div>").join("\n");
+    text = text.split("</DIV>").join("\n");
+    text = text.split("</tr>").join("\n");
+    text = text.split("</TR>").join("\n");
+    text = text.split("</li>").join("\n");
+    text = text.split("</LI>").join("\n");
+    text = text.split("</h1>").join("\n\n");
+    text = text.split("</h2>").join("\n\n");
+    text = text.split("</h3>").join("\n\n");
+    text = text.split("</h4>").join("\n\n");
+    text = text.split("</h5>").join("\n\n");
+    text = text.split("</h6>").join("\n\n");
+    text = text.split("</H1>").join("\n\n");
+    text = text.split("</H2>").join("\n\n");
+    text = text.split("</H3>").join("\n\n");
+    text = text.split("</H4>").join("\n\n");
+    text = text.split("</H5>").join("\n\n");
+    text = text.split("</H6>").join("\n\n");
+    text = text.split("</blockquote>").join("\n");
+
+    /* ── 2. Replace <br> variants with newline ───────────────────── */
+    text = text.split("<br>").join("\n");
+    text = text.split("<BR>").join("\n");
+    text = text.split("<br/>").join("\n");
+    text = text.split("<BR/>").join("\n");
+    text = text.split("<br />").join("\n");
+    text = text.split("<BR />").join("\n");
+
+    /* ── 3. Remove <style> … </style> blocks entirely ───────────── */
+    var styleStart = text.indexOf("<style");
+    while (styleStart > -1) {
+      var styleEnd = text.indexOf("</style>", styleStart);
+      if (styleEnd > -1) {
+        text = text.substring(0, styleStart) + text.substring(styleEnd + 8);
+        } else {
+        break; /* malformed — stop to avoid infinite loop */
+        }
+      styleStart = text.indexOf("<style");
+    }
+    /* ── 4. Remove <script> … </script> blocks entirely ─────────── */
+    var scriptStart = text.indexOf("<script");
+    while (scriptStart > -1) {
+      var scriptEnd = text.indexOf("</script>", scriptStart);
+      if (scriptEnd > -1) {
+        text = text.substring(0, scriptStart) + text.substring(scriptEnd + 9);
+        } else {
+        break;
+        }
+      scriptStart = text.indexOf("<script");
+    }
+    /* ── 5. Strip all remaining HTML tags with a simple loop ───────
+       SSJS does not support RegExp.replace with callbacks, so we
+       manually find and remove each tag.                            */
+    var result  = "";
+    var inTag   = false;
+    var len     = text.length;
+    for (var idx = 0; idx < len; idx++) {
+      var ch = text.charAt(idx);
+      if (ch === "<") {
+        inTag = true;
+        } else if (ch === ">") {
+        inTag = false;
+        } else if (!inTag) {
+        result += ch;
+        }
+    }
+    text = result;
+
+    /* ── 6. Decode common HTML entities ─────────────────────────── */
+    text = text.split("&nbsp;").join(" ");
+    text = text.split("&amp;").join("&");
+    text = text.split("&lt;").join("<");
+    text = text.split("&gt;").join(">");
+    text = text.split("&quot;").join('"');
+    text = text.split("&#39;").join("'");
+    text = text.split("&ldquo;").join('"');
+    text = text.split("&rdquo;").join('"');
+    text = text.split("&lsquo;").join("'");
+    text = text.split("&rsquo;").join("'");
+    text = text.split("&mdash;").join("—");
+    text = text.split("&ndash;").join("–");
+    text = text.split("&hellip;").join("...");
+    text = text.split("&copy;").join("©");
+    text = text.split("&reg;").join("®");
+    text = text.split("&trade;").join("™");
+
+    /* ── 7. Collapse runs of spaces/tabs on each line ────────────── */
+    var lines    = text.split("\n");
+    var cleaned  = [];
+    var blankRun = 0;
+    for (var li = 0; li < lines.length; li++) {
+        /* collapse multiple spaces/tabs to a single space */
+      var line = "";
+      var prevSpace = false;
+      for (var ci = 0; ci < lines[li
+        ].length; ci++) {
+        var c = lines[li
+            ].charAt(ci);
+        if (c === " " || c === "\t" || c === "\r") {
+          if (!prevSpace) { line += " "; prevSpace = true;
+                }
+            } else {
+          line += c;
+          prevSpace = false;
+            }
+        }
+      line = line.replace(/^\s+|\s+$/g,
+        ""); /* trim leading/trailing */
+
+      if (line === "") {
+        blankRun++;
+        if (blankRun <= 1) cleaned.push(""); /* allow at most 1 blank line */
+        } else {
+        blankRun = 0;
+        cleaned.push(line);
+        }
+    }
+
+    return cleaned.join("\n").replace(/^\s+|\s+$/g,
+    ""); /* final trim */
 }
 /* ══════════════════════════════════════════════════════════════════
      MAIN EXECUTION
@@ -114,15 +235,12 @@
 /* ── STEP 0: Sanity check — can we write to the Log DE? ────────── */
   writeLog("INFO",
 "SCRIPT_START",
-"Script Activity started. Run ID: " + runId,
-"Full overwrite mode — all matching assets will be fetched and inserted.",
+"Script Activity started (TEXT mode). Run ID: " + runId,
+"Full overwrite mode — plain text content will be extracted.",
 0);
 
   try {
     /* ── STEP 0.5: Clear all existing rows from the Data DE ──────── */
-    /* Uses WSProxy performItem with "ClearData" action to wipe the
-       entire DE in a single SOAP call. This is the SFMC-supported
-       way to clear a Data Extension programmatically. */
     var clearProxy  = new Script.Util.WSProxy();
     var clearResult = clearProxy.performItem("DataExtension",
     { CustomerKey: DE_DATA_EXTKEY
@@ -172,16 +290,14 @@
     var hasMorePages = true;
 
     while (hasMorePages && currentPage <= MAX_PAGES) {
-            /* Simple filter: name LIKE pattern (fetch ALL matching assets) */
+
       var queryJson = '{
-                "query": {'
-        + '"property": "name",
+                "query": {
+                    "property": "name",
                     "simpleOperator": "like",
-                    "value": "' + SEARCH_PATTERN + '%"'
-        + '
-                },
-                "page": {
-                    "page":' + currentPage + ',
+                    "value":"'
+        + SEARCH_PATTERN + '%"},"page":{"page":' + currentPage
+        + ',
                     "pageSize":' + PAGE_SIZE + '
                 },
                 "fields": []
@@ -193,9 +309,6 @@
             "Payload: " + queryJson,
             0);
 
-      /* Use Script.Util.HttpRequest instead of HTTP.Post —
-         HTTP.Post with 5 params corrupts the request body in
-         Script Activity context, causing 400 Bad Request errors. */
       var req = new Script.Util.HttpRequest(REST_BASE + "/asset/v1/content/assets/query");
       req.emptyContentHandling = 0;
       req.retries = 2;
@@ -214,8 +327,7 @@
             "Response received.",
         queryBodyStr ? queryBodyStr.substring(0,
             2000) : "EMPTY",
-            0
-      );
+            0);
 
       if (!queryBodyStr || queryBodyStr == "") {
         writeLog("WARN",
@@ -241,8 +353,7 @@
             "QUERY_COUNTS_" + currentPage,
             "Items this page: " + itemCount + " | Total matching: " + totalCount,
             "N/A",
-            0
-      );
+            0);
 
       if (itemCount == 0) {
         writeLog("INFO",
@@ -262,14 +373,12 @@
         var assetId     = asset.id          ? asset.id.toString()          : "";
         var customerKey = asset.customerKey ? asset.customerKey.toString() : "";
         var subject     = "";
-        var contentHtml = "";
+        var contentText = ""; /* ← plain text (replaces contentHtml) */
 
-        /* The POST /query endpoint returns minimal fields only.
-           To get views (subjectline, html content), we must call
-           GET /asset/v1/content/assets/{id} for each asset. */
         var fullAsset = null;
         try {
-          var detailReq = new Script.Util.HttpRequest(REST_BASE + "/asset/v1/content/assets/" + assetId);
+          var detailReq = new Script.Util.HttpRequest(
+            REST_BASE + "/asset/v1/content/assets/" + assetId);
           detailReq.emptyContentHandling = 0;
           detailReq.retries = 2;
           detailReq.continueOnError = true;
@@ -284,13 +393,17 @@
             fullAsset = Platform.Function.ParseJSON(detailStr);
 
             /* Extract Subject from possible locations */
-            if (fullAsset.views && fullAsset.views.subjectline && fullAsset.views.subjectline.content) {
+            if (fullAsset.views && fullAsset.views.subjectline &&
+                fullAsset.views.subjectline.content) {
               subject = fullAsset.views.subjectline.content;
                         } else if (fullAsset.metaData && fullAsset.metaData.subject) {
               subject = fullAsset.metaData.subject;
-                        } else if (fullAsset.data && fullAsset.data.email && fullAsset.data.email.legacy && fullAsset.data.email.legacy.subject) {
+                        } else if (fullAsset.data && fullAsset.data.email &&
+                       fullAsset.data.email.legacy &&
+                       fullAsset.data.email.legacy.subject) {
               subject = fullAsset.data.email.legacy.subject;
-                        } else if (fullAsset.channels && fullAsset.channels.email && fullAsset.channels.email.subject) {
+                        } else if (fullAsset.channels && fullAsset.channels.email &&
+                       fullAsset.channels.email.subject) {
               subject = fullAsset.channels.email.subject;
                         }
                         /* Log the asset structure for debugging */
@@ -300,83 +413,63 @@
                 if (fullAsset.views.hasOwnProperty(vk)) viewKeys.push(vk);
                             }
                         }
-            var htmlSubKeys = [];
-            if (fullAsset.views && fullAsset.views.html) {
-              for (var hk in fullAsset.views.html) {
-                if (fullAsset.views.html.hasOwnProperty(hk)) htmlSubKeys.push(hk);
-                            }
-                        }
             writeLog("INFO",
                         "ASSET_STRUCTURE",
-                        "Asset: " + assetName + " | assetType: " + (fullAsset.assetType ? Stringify(fullAsset.assetType) : "N/A"),
-                        "views keys: [" + viewKeys.join(",") + "] | views.html keys: [" + htmlSubKeys.join(",") + "] | hasDirectContent: " + (fullAsset.content ? "Y(" + fullAsset.content.toString().length + ")": "N"),
-              totalAssetsProcessed
-            );
+                        "Asset: " + assetName + " | assetType: " +
+                (fullAsset.assetType ? Stringify(fullAsset.assetType) : "N/A"),
+                        "views keys: [" + viewKeys.join(",") + "]", totalAssetsProcessed);
 
             /* ═══════════════════════════════════════════════════════
-               CONTENT EXTRACTION STRATEGY
+               TEXT EXTRACTION STRATEGY
                ─────────────────────────────────────────────────────
-               Template-based emails:
-                 views.html.content  → only the CSS/template skeleton
-                 views.html.slots    → JSON structure with actual content
-                   └─ {slotKey}.blocks.{blockKey}.content → real HTML
-               The slots JSON is merged by SFMC's rendering engine at
-               send-time;  there are NO matching placeholders in the
-               skeleton HTML.  So we extract block content DIRECTLY.
-
-               Freeform/paste emails:
-                 views.html.content  → full HTML with all content
-                 views.html.slots    → empty / not present
+               Priority order:
+               1. views.text.content       — SFMC native text version
+               2. views.text.slots blocks  — text blocks in template
+               3. Strip HTML from views.html (slot blocks or skeleton)
+               4. Strip HTML from fullAsset.content (direct property)
                ═══════════════════════════════════════════════════════ */
+                        /* ── PRIORITY 1 & 2: Check views.text (native text view) ── */
+            if (fullAsset.views && fullAsset.views.text) {
+              var textView = fullAsset.views.text;
 
-            if (fullAsset.views && fullAsset.views.html) {
-              var htmlView = fullAsset.views.html;
+              /* Collect text from slot blocks first (template emails) */
+              var allTextContent = "";
+              var textSlotCount  = 0;
 
-              /* ── 1. Collect ALL slot → block content ─────────────── */
-              var allBlockContent = "";
-              var slotCount = 0;
-
-              if (htmlView.slots) {
-                for (var slotKey in htmlView.slots) {
-                  if (htmlView.slots.hasOwnProperty(slotKey)) {
-                    slotCount++;
-                    var slotObj = htmlView.slots[slotKey
+              if (textView.slots) {
+                for (var tSlotKey in textView.slots) {
+                  if (textView.slots.hasOwnProperty(tSlotKey)) {
+                    textSlotCount++;
+                    var tSlotObj = textView.slots[tSlotKey
                                         ];
 
-                    /* Each slot has a "blocks" object with content blocks */
-                    if (slotObj.blocks) {
-                      for (var blockKey in slotObj.blocks) {
-                        if (slotObj.blocks.hasOwnProperty(blockKey)) {
-                          var block = slotObj.blocks[blockKey
+                    if (tSlotObj.blocks) {
+                      for (var tBlockKey in tSlotObj.blocks) {
+                        if (tSlotObj.blocks.hasOwnProperty(tBlockKey)) {
+                          var tBlock = tSlotObj.blocks[tBlockKey
                                                     ];
-
-                          /* block.content holds the actual HTML for this content block */
-                          if (block.content) {
-                            allBlockContent += block.content;
+                          if (tBlock.content) {
+                            allTextContent += tBlock.content + "\n\n";
                                                     }
-                                                    /* Some blocks store content in block.design (rich content) */
-                          if (!block.content && block.design) {
-                            allBlockContent += block.design;
-                                                    }
-                                                    /* Some blocks may have nested slots (stacked layouts) */
-                          if (block.slots) {
-                            for (var nestedSlotKey in block.slots) {
-                              if (block.slots.hasOwnProperty(nestedSlotKey)) {
-                                var nestedSlot = block.slots[nestedSlotKey
+                                                    /* Nested slots */
+                          if (tBlock.slots) {
+                            for (var tNslotKey in tBlock.slots) {
+                              if (tBlock.slots.hasOwnProperty(tNslotKey)) {
+                                var tNslot = tBlock.slots[tNslotKey
                                                                 ];
-                                if (nestedSlot.blocks) {
-                                  for (var nestedBlockKey in nestedSlot.blocks) {
-                                    if (nestedSlot.blocks.hasOwnProperty(nestedBlockKey)) {
-                                      var nestedBlock = nestedSlot.blocks[nestedBlockKey
+                                if (tNslot.blocks) {
+                                  for (var tNblockKey in tNslot.blocks) {
+                                    if (tNslot.blocks.hasOwnProperty(tNblockKey)) {
+                                      var tNblock = tNslot.blocks[tNblockKey
                                                                             ];
-                                      if (nestedBlock.content) {
-                                        allBlockContent += nestedBlock.content;
+                                      if (tNblock.content) {
+                                        allTextContent += tNblock.content + "\n\n";
                                                                             }
                                                                         }
                                                                     }
                                                                 }
-                                if (nestedSlot.content) {
-                                  allBlockContent += nestedSlot.content;
+                                if (tNslot.content) {
+                                  allTextContent += tNslot.content + "\n\n";
                                                                 }
                                                             }
                                                         }
@@ -384,111 +477,131 @@
                                                 }
                                             }
                                         }
-                                        /* Slot itself may have direct content (no blocks) */
-                    if (slotObj.content && !slotObj.blocks) {
-                      allBlockContent += slotObj.content;
+                    if (tSlotObj.content && !tSlotObj.blocks) {
+                      allTextContent += tSlotObj.content + "\n\n";
                                         }
                                     }
                                 }
                             }
-                            /* ── 2. Decide which content to use ──────────────────── */
-              if (slotCount > 0 && allBlockContent) {
-                                /* TEMPLATE-BASED email: use the actual block content.
-                   Wrap with the <style> section from the skeleton so
-                   the CSS styles are preserved. */
-                var styleBlock = "";
-                if (htmlView.content) {
-                  var styleStart = htmlView.content.indexOf("<style");
-                  if (styleStart > -1) {
-                    var styleEnd = htmlView.content.indexOf("</style>", styleStart);
-                    if (styleEnd > -1) {
-                      styleBlock = htmlView.content.substring(styleStart, styleEnd + 8);
-                                        }
-                                    }
-                                }
-                contentHtml = styleBlock + allBlockContent;
-                            } else if (htmlView.content) {
-                                /* FREEFORM email: views.html.content has everything */
-                contentHtml = htmlView.content;
+
+              if (textSlotCount > 0 && allTextContent) {
+                                /* Template-based email: text from slot blocks */
+                contentText = allTextContent;
+                            } else if (textView.content) {
+                                /* Freeform email or direct text view content */
+                contentText = textView.content;
                             }
                         }
-                        /* Fallback: preheader or direct content property */
-            if (!contentHtml || contentHtml === "") {
-              if (fullAsset.views && fullAsset.views.preheader && fullAsset.views.preheader.content) {
-                contentHtml = fullAsset.views.preheader.content;
-                            } else if (fullAsset.content) {
-                contentHtml = fullAsset.content;
+                        /* ── PRIORITY 3: No text view — strip HTML from html view ─ */
+            if (!contentText || contentText === "") {
+              if (fullAsset.views && fullAsset.views.html) {
+                var htmlView = fullAsset.views.html;
+
+                var allBlockHtml = "";
+                var slotCount    = 0;
+
+                if (htmlView.slots) {
+                  for (var slotKey in htmlView.slots) {
+                    if (htmlView.slots.hasOwnProperty(slotKey)) {
+                      slotCount++;
+                      var slotObj = htmlView.slots[slotKey
+                                            ];
+
+                      if (slotObj.blocks) {
+                        for (var blockKey in slotObj.blocks) {
+                          if (slotObj.blocks.hasOwnProperty(blockKey)) {
+                            var block = slotObj.blocks[blockKey
+                                                        ];
+                            if (block.content) {
+                              allBlockHtml += block.content;
+                                                        } else if (block.design) {
+                              allBlockHtml += block.design;
+                                                        }
+                            if (block.slots) {
+                              for (var nestedSlotKey in block.slots) {
+                                if (block.slots.hasOwnProperty(nestedSlotKey)) {
+                                  var nestedSlot = block.slots[nestedSlotKey
+                                                                    ];
+                                  if (nestedSlot.blocks) {
+                                    for (var nestedBlockKey in nestedSlot.blocks) {
+                                      if (nestedSlot.blocks.hasOwnProperty(nestedBlockKey)) {
+                                        var nestedBlock = nestedSlot.blocks[nestedBlockKey
+                                                                                ];
+                                        if (nestedBlock.content) {
+                                          allBlockHtml += nestedBlock.content;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                  if (nestedSlot.content) {
+                                    allBlockHtml += nestedSlot.content;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                      if (slotObj.content && !slotObj.blocks) {
+                        allBlockHtml += slotObj.content;
+                                            }
+                                        }
+                                    }
+                                }
+
+                var rawHtml = (slotCount > 0 && allBlockHtml)
+                  ? allBlockHtml
+                  : (htmlView.content ? htmlView.content : "");
+
+                contentText = stripHtmlToText(rawHtml);
                             }
+                        }
+                        /* ── PRIORITY 4: Fallback — direct content property ───── */
+            if (!contentText || contentText === "") {
+              if (fullAsset.views && fullAsset.views.preheader &&
+                  fullAsset.views.preheader.content) {
+                contentText = stripHtmlToText(fullAsset.views.preheader.content);
+                            } else if (fullAsset.content) {
+                contentText = stripHtmlToText(fullAsset.content.toString());
+                            }
+                        }
+                        /* If the text view content also contained HTML, strip it */
+            if (contentText && contentText.indexOf("<") > -1) {
+              contentText = stripHtmlToText(contentText);
                         }
                     }
                 } catch (detailEx) {
           writeLog("WARN",
                     "DETAIL_FAIL",
                     "Could not fetch full details for asset: " + assetName,
-                    "Error: " + Stringify(detailEx),
-            totalAssetsProcessed
-          );
+                    "Error: " + Stringify(detailEx), totalAssetsProcessed);
                 }
-                /* Debug: log what was extracted for each asset */
-        var slotsFound = 0;
-        var blockDetails = "";
-        if (fullAsset && fullAsset.views && fullAsset.views.html && fullAsset.views.html.slots) {
-          for (var dbgKey in fullAsset.views.html.slots) {
-            if (fullAsset.views.html.slots.hasOwnProperty(dbgKey)) {
-              slotsFound++;
-              var dbgSlot = fullAsset.views.html.slots[dbgKey
-                            ];
-              blockDetails += "Slot[" + dbgKey + "]: ";
-
-              if (dbgSlot.blocks) {
-                for (var dbgBk in dbgSlot.blocks) {
-                  if (dbgSlot.blocks.hasOwnProperty(dbgBk)) {
-                    var dbgBlock = dbgSlot.blocks[dbgBk
-                                        ];
-                    var bProps = [];
-                    for (var bp in dbgBlock) {
-                      if (dbgBlock.hasOwnProperty(bp)) bProps.push(bp);
-                                        }
-                    blockDetails += "Block[" + dbgBk + "] props=(" + bProps.join(",") + ") ";
-                    blockDetails += "hasContent=" + (dbgBlock.content ? "Y(" + dbgBlock.content.toString().length + ")": "N") + " ";
-                    blockDetails += "hasSuperContent=" + (dbgBlock.superContent ? "Y": "N") + " ";
-                    blockDetails += "hasData=" + (dbgBlock.data ? "Y": "N") + " ";
-                                    }
-                                }
-                            } else {
-                blockDetails += "(no blocks obj) ";
-                            }
-              if (dbgSlot.content) blockDetails += "slotContent=Y(" + dbgSlot.content.toString().length + ") ";
-                        }
-                    }
-                }
-
+                /* Debug: log extraction result */
         writeLog("INFO",
                 "CONTENT_DEBUG",
-                "Asset: " + assetName + " | Type: " + (fullAsset ? (fullAsset.assetType ? fullAsset.assetType.name : "unknown") : "N/A"),
-                "Slots: " + slotsFound + " | ContentLen: " + (contentHtml ? contentHtml.length : 0) + " | " + blockDetails,
-          totalAssetsProcessed
-        );
-
-        /* Clean unwanted HTML entities before storing */
-        contentHtml = cleanHtmlEntities(contentHtml);
+                "Asset: " + assetName + " | Type: " +
+            (fullAsset ? (fullAsset.assetType ? fullAsset.assetType.name : "unknown") : "N/A"),
+                "TextLen: " + (contentText ? contentText.length : 0) +
+            " | Source: " + (fullAsset && fullAsset.views && fullAsset.views.text
+              ? "views.text": "html-stripped"),
+          totalAssetsProcessed);
 
         /* Truncate to 12000 chars (Content field must be nvarchar(max) in Email Studio) */
-        if (contentHtml && contentHtml.length > 12000) {
-          contentHtml = contentHtml.substring(0,
+        if (contentText && contentText.length > 12000) {
+          contentText = contentText.substring(0,
                     12000);
                 }
                 /* ── STEP 4: Insert asset into Data DE ─────────────────────── */
-        insertAsset(assetName, assetId, customerKey, subject, contentHtml);
+        insertAsset(assetName, assetId, customerKey, subject, contentText);
         totalAssetsProcessed++;
 
         writeLog("INFO",
                 "INSERT_OK",
                 "Inserted: " + assetName,
                 "ID=" + assetId + " | Key=" + customerKey + " | Subject=" + subject
-            + " | ModifiedDate=" + (fullAsset && fullAsset.modifiedDate ? fullAsset.modifiedDate : "N/A"),
-          totalAssetsProcessed
-        );
+            + " | ModifiedDate=" + (fullAsset && fullAsset.modifiedDate
+              ? fullAsset.modifiedDate : "N/A"),
+          totalAssetsProcessed);
             }
             /* ── Pagination ───────────────────────────────────────────── */
       if (currentPage * PAGE_SIZE >= totalCount) {
@@ -498,24 +611,24 @@
             }
         }
         /* ── STEP 5: WSProxy fallback for legacy Email objects ────────── */
+        /* Uses TextBody instead of HTMLBody to get plain text directly    */
     var prox = new Script.Util.WSProxy();
     var wsFilter = {
       Property: "Name",
       SimpleOperator: "like",
       Value: SEARCH_PATTERN + "%"
         };
-    var wsResult = prox.retrieve(
-      "Email",
+    var wsResult = prox.retrieve("Email",
         [
             "ID",
             "Name",
             "CustomerKey",
             "Subject",
+            "TextBody",
             "HTMLBody",
             "ModifiedDate"
         ],
-      wsFilter
-    );
+      wsFilter);
 
     var wsCount = (wsResult && wsResult.Results) ? wsResult.Results.length : 0;
     writeLog("INFO",
@@ -533,12 +646,15 @@
         var emId          = em.ID          ? em.ID.toString()          : "";
         var emCustomerKey = em.CustomerKey ? em.CustomerKey.toString() : "";
         var emSubject     = em.Subject     ? em.Subject.toString()     : "";
-        var emContent     = em.HTMLBody    ? em.HTMLBody.toString()    : "";
 
-        /* Clean unwanted HTML entities */
-        emContent = cleanHtmlEntities(emContent);
-
-        /* Truncate to 12000 chars (Content field must be nvarchar(max) in Email Studio) */
+        /* Prefer TextBody; fall back to stripping HTMLBody */
+        var emContent = "";
+        if (em.TextBody && em.TextBody.toString() !== "") {
+          emContent = em.TextBody.toString();
+                } else if (em.HTMLBody) {
+          emContent = stripHtmlToText(em.HTMLBody.toString());
+                }
+                /* Truncate to 12000 chars */
         if (emContent && emContent.length > 12000) {
           emContent = emContent.substring(0,
                     12000);
@@ -552,17 +668,14 @@
                 "WSPROXY_INSERT",
                 "Legacy email inserted: " + emName,
                 "ID=" + emId + " | Key=" + emCustomerKey + " | ModifiedDate=" + emModDate,
-          totalAssetsProcessed
-        );
+          totalAssetsProcessed);
             }
         }
         /* ── STEP 6: Final summary ───────────────────────────────────── */
     writeLog("INFO",
         "SCRIPT_COMPLETE",
-        "Finished. Total assets: " + totalAssetsProcessed,
-        "Run ID: " + runId,
-      totalAssetsProcessed
-    );
+        "Finished (TEXT mode). Total assets: " + totalAssetsProcessed,
+        "Run ID: " + runId, totalAssetsProcessed);
     } catch (ex) {
         /* Log the error, then re-throw so Automation shows FAILED */
     try {
