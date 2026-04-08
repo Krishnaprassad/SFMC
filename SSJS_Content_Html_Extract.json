@@ -1,0 +1,579 @@
+<script runat="server">
+  Platform.Load("core",
+"1.1.1");
+
+  /* ══════════════════════════════════════════════════════════════════
+     EO Asset Script Activity  (v4 — Full Overwrite)
+     ────────────────────────────────────────────────────────────────
+     CHANGES IN v4:
+       1. Removed 24-hour cutoff — fetches ALL matching assets.
+       2. Clears the Data DE before inserting, so every run is a
+          full overwrite (avoids duplicate primary-key errors).
+       3. Search pattern changed to "Message_Cente" (prefix match).
+       4. Uses Rows.Add() for inserts after the DE is cleared.
+     ────────────────────────────────────────────────────────────────
+     PREREQUISITES:
+       - All non-PK fields in the Log DE MUST be Nullable.
+       - Log_ID MUST be the Primary Key in the Log DE.
+       - Asset_Name MUST be the Primary Key in the Data DE.
+       - Content field MUST be nvarchar(max) (created in Email Studio
+         with a BLANK length).
+  ══════════════════════════════════════════════════════════════════ */
+/* ── 0. Configuration ──────────────────────────────────────────── */
+  var AUTH_URL       = "https://mcxdf19724mz1blcrm78fnsn5w21.auth.marketingcloudapis.com/v2/token";
+  var REST_BASE      = "https://mcxdf19724mz1blcrm78fnsn5w21.rest.marketingcloudapis.com";
+  var CLIENT_ID      = "3udrkn0y9k3yxgge4vu1x4vb";
+  var CLIENT_SECRET  = "ObuzdthdR3GdrUCKktvQOd1d";
+
+  /* ── IMPORTANT: Use the EXTERNAL KEY of each DE, NOT the name ── */
+  var DE_DATA_EXTKEY = "46F03A89-6C67-4459-B3E1-1FAC849768D6"; // EO_Asset_Script_Activity_Updated
+  var DE_LOG_EXTKEY  = "6949E722-3710-445D-9D1B-0EB4CD735F37"; // EO_Asset_Script_Activity_Log
+
+  /* DE name — used for Platform.Function calls */
+  var DE_DATA_NAME   = "EO_Asset_Script_Activity_Updated";
+
+  var SEARCH_PATTERN = "Message_Cente";
+  var MAX_PAGES      = 20;
+  var PAGE_SIZE      = 50;
+
+  /* ── Log counter for unique IDs ────────────────────────────────── */
+  var logCounter  = 0;
+  var runTimestamp = Now();
+
+  /* Simple run ID from timestamp */
+  var d     = new Date();
+  var runId = "" + d.getFullYear()
+    + ("0" + (d.getMonth() + 1)).slice(-2)
+    + ("0" + d.getDate()).slice(-2)
+    + ("0" + d.getHours()).slice(-2)
+    + ("0" + d.getMinutes()).slice(-2)
+    + ("0" + d.getSeconds()).slice(-2);
+
+  /* ── Helper: get response body from HTTP.Post() ────────────────── */
+  function getResponseBody(resp) {
+    if (!resp) return "";
+    if (typeof resp == "string") return resp;
+    if (resp.Response && resp.Response.length > 0) return resp.Response[
+        0
+    ].toString();
+    return Stringify(resp);
+}
+/* ── Helper: write a log row using Core Library Rows.Add() ─────── */
+  function writeLog(level, stepName, message, detail, assetsProcessed) {
+    logCounter++;
+    var logId = runId + "_" + logCounter;
+
+    var logDE = DataExtension.Init(DE_LOG_EXTKEY);
+    logDE.Rows.Add({
+      Log_ID:           logId,
+      Run_Timestamp:    runTimestamp,
+      Log_Level:        level    || "INFO",
+      Step_Name:        stepName || "UNKNOWN",
+      Message:          message  ? message.toString().substring(0,
+        4000) : "N/A",
+      Detail:           detail   ? detail.toString().substring(0,
+        4000)  : "N/A",
+      Assets_Processed: (assetsProcessed != null) ? assetsProcessed : 0
+    });
+}
+/* ── Helper: insert a row into the Data DE ──────────────────────── */
+/* Uses DataExtension.Init(ExternalKey).Rows.Add() to insert a new row.
+     The DE is cleared at the start of each run, so we only INSERT.
+
+     12,000 CHAR SUPPORT:
+       The "Content" field MUST be created in Email Studio with a BLANK
+       length so it becomes nvarchar(max).  Do NOT edit it in Contact
+       Builder afterwards — CB enforces a 4,000-char cap.              */
+  function insertAsset(assetName, assetId, customerKey, subject, contentHtml) {
+    var dataDE = DataExtension.Init(DE_DATA_EXTKEY);
+    dataDE.Rows.Add({
+      Asset_Name:        assetName   || "N/A",
+      Asset_ID:          assetId     || "N/A",
+      Customer_Key:      customerKey || "N/A",
+      Subject:           subject     || "N/A",
+      Content:           contentHtml || "N/A",
+      Last_Updated_Date: Now()
+    });
+}
+/* ── Helper: strip unwanted HTML entities from extracted content ── */
+  function cleanHtmlEntities(html) {
+    if (!html) return html;
+    html = html.split("&nbsp;").join(" ");
+    html = html.split("&ldquo;").join('"');
+    html = html.split("&rdquo;").join('"');
+    html = html.split("&lsquo;").join("'");
+    html = html.split("&rsquo;").join("'");
+    html = html.split("&mdash;").join("—");
+    html = html.split("&ndash;").join("–");
+    html = html.split("&hellip;").join("...");
+    return html;
+}
+/* ══════════════════════════════════════════════════════════════════
+     MAIN EXECUTION
+  ══════════════════════════════════════════════════════════════════ */
+/* ── STEP 0: Sanity check — can we write to the Log DE? ────────── */
+  writeLog("INFO",
+"SCRIPT_START",
+"Script Activity started. Run ID: " + runId,
+"Full overwrite mode — all matching assets will be fetched and inserted.",
+0);
+
+  try {
+    /* ── STEP 0.5: Clear all existing rows from the Data DE ──────── */
+    /* Uses WSProxy performItem with "ClearData" action to wipe the
+       entire DE in a single SOAP call. This is the SFMC-supported
+       way to clear a Data Extension programmatically. */
+    var clearProxy  = new Script.Util.WSProxy();
+    var clearResult = clearProxy.performItem("DataExtension",
+    { CustomerKey: DE_DATA_EXTKEY
+    },
+    "ClearData");
+
+    var clearStatus = (clearResult && clearResult.Status) ? clearResult.Status : "Unknown";
+    writeLog("INFO",
+    "DE_CLEARED",
+    "Cleared Data DE before full reload.",
+    "ClearData status: " + clearStatus,
+    0);
+
+    /* ── STEP 1: Get OAuth2 Access Token ─────────────────────────── */
+    var authPayload = '{
+        "grant_type": "client_credentials",
+        "client_id":"'
+      + CLIENT_ID + '","client_secret":"' + CLIENT_SECRET + '"}';
+
+    var authResp = HTTP.Post(AUTH_URL,
+        "application/json", authPayload);
+
+    if (!authResp || !authResp.Response || authResp.Response.length == 0) {
+      throw "AUTH_FAIL: No response from token endpoint.";
+        }
+
+    var authBody    = Platform.Function.ParseJSON(authResp.Response[
+            0
+        ]);
+    var accessToken = authBody.access_token;
+
+    if (!accessToken) {
+      throw "AUTH_FAIL: No access_token. Raw: " + authResp.Response[
+                0
+            ];
+        }
+
+    writeLog("INFO",
+        "AUTH_SUCCESS",
+        "OAuth2 token acquired.",
+        "Token length: " + accessToken.length,
+        0);
+
+    /* ── STEP 2: Query Content Builder ───────────────────────────── */
+    var totalAssetsProcessed = 0;
+    var currentPage  = 1;
+    var hasMorePages = true;
+
+    while (hasMorePages && currentPage <= MAX_PAGES) {
+            /* Simple filter: name LIKE pattern (fetch ALL matching assets) */
+      var queryJson = '{
+                "query": {'
+        + '"property": "name",
+                    "simpleOperator": "like",
+                    "value": "' + SEARCH_PATTERN + '%"'
+        + '
+                },
+                "page": {
+                    "page":' + currentPage + ',
+                    "pageSize":' + PAGE_SIZE + '
+                },
+                "fields": []
+            }';
+
+      writeLog("INFO",
+            "QUERY_PAGE_" + currentPage,
+            "Sending Content Builder query.",
+            "Payload: " + queryJson,
+            0);
+
+      /* Use Script.Util.HttpRequest instead of HTTP.Post —
+         HTTP.Post with 5 params corrupts the request body in
+         Script Activity context, causing 400 Bad Request errors. */
+      var req = new Script.Util.HttpRequest(REST_BASE + "/asset/v1/content/assets/query");
+      req.emptyContentHandling = 0;
+      req.retries = 2;
+      req.continueOnError = true;
+      req.contentType = "application/json";
+      req.setHeader("Authorization",
+            "Bearer " + accessToken);
+      req.postData = queryJson;
+      req.method = "POST";
+      var httpResp = req.send();
+
+      var queryBodyStr = String(httpResp.content);
+
+      writeLog("INFO",
+            "QUERY_RESP_" + currentPage,
+            "Response received.",
+        queryBodyStr ? queryBodyStr.substring(0,
+            2000) : "EMPTY",
+            0
+      );
+
+      if (!queryBodyStr || queryBodyStr == "") {
+        writeLog("WARN",
+                "QUERY_EMPTY",
+                "Empty response on page " + currentPage,
+                "Stopping pagination.",
+                0);
+        hasMorePages = false;
+        break;
+            }
+
+      var qBody = Platform.Function.ParseJSON(queryBodyStr);
+
+      if (qBody && qBody.message && !qBody.items) {
+        throw "CB_API_ERROR: " + qBody.message
+          + (qBody.errorcode ? " [code:" + qBody.errorcode + "]": "");
+            }
+
+      var itemCount  = (qBody && qBody.items) ? qBody.items.length : 0;
+      var totalCount = (qBody && qBody.count)  ? qBody.count        : 0;
+
+      writeLog("INFO",
+            "QUERY_COUNTS_" + currentPage,
+            "Items this page: " + itemCount + " | Total matching: " + totalCount,
+            "N/A",
+            0
+      );
+
+      if (itemCount == 0) {
+        writeLog("INFO",
+                "QUERY_DONE",
+                "No more assets. Pages queried: " + currentPage,
+                "N/A",
+                0);
+        hasMorePages = false;
+        break;
+            }
+            /* ── STEP 3: Process each asset ──────────────────────────── */
+      for (var i = 0; i < qBody.items.length; i++) {
+        var asset = qBody.items[i
+                ];
+
+        var assetName   = asset.name        ? asset.name.toString()        : "";
+        var assetId     = asset.id          ? asset.id.toString()          : "";
+        var customerKey = asset.customerKey ? asset.customerKey.toString() : "";
+        var subject     = "";
+        var contentHtml = "";
+
+        /* The POST /query endpoint returns minimal fields only.
+           To get views (subjectline, html content), we must call
+           GET /asset/v1/content/assets/{id} for each asset. */
+        var fullAsset = null;
+        try {
+          var detailReq = new Script.Util.HttpRequest(REST_BASE + "/asset/v1/content/assets/" + assetId);
+          detailReq.emptyContentHandling = 0;
+          detailReq.retries = 2;
+          detailReq.continueOnError = true;
+          detailReq.contentType = "application/json";
+          detailReq.setHeader("Authorization",
+                    "Bearer " + accessToken);
+          detailReq.method = "GET";
+          var detailResp = detailReq.send();
+          var detailStr  = String(detailResp.content);
+
+          if (detailStr && detailStr != "") {
+            fullAsset = Platform.Function.ParseJSON(detailStr);
+
+            /* Extract Subject from possible locations */
+            if (fullAsset.views && fullAsset.views.subjectline && fullAsset.views.subjectline.content) {
+              subject = fullAsset.views.subjectline.content;
+                        } else if (fullAsset.metaData && fullAsset.metaData.subject) {
+              subject = fullAsset.metaData.subject;
+                        } else if (fullAsset.data && fullAsset.data.email && fullAsset.data.email.legacy && fullAsset.data.email.legacy.subject) {
+              subject = fullAsset.data.email.legacy.subject;
+                        } else if (fullAsset.channels && fullAsset.channels.email && fullAsset.channels.email.subject) {
+              subject = fullAsset.channels.email.subject;
+                        }
+                        /* Log the asset structure for debugging */
+            var viewKeys = [];
+            if (fullAsset.views) {
+              for (var vk in fullAsset.views) {
+                if (fullAsset.views.hasOwnProperty(vk)) viewKeys.push(vk);
+                            }
+                        }
+            var htmlSubKeys = [];
+            if (fullAsset.views && fullAsset.views.html) {
+              for (var hk in fullAsset.views.html) {
+                if (fullAsset.views.html.hasOwnProperty(hk)) htmlSubKeys.push(hk);
+                            }
+                        }
+            writeLog("INFO",
+                        "ASSET_STRUCTURE",
+                        "Asset: " + assetName + " | assetType: " + (fullAsset.assetType ? Stringify(fullAsset.assetType) : "N/A"),
+                        "views keys: [" + viewKeys.join(",") + "] | views.html keys: [" + htmlSubKeys.join(",") + "] | hasDirectContent: " + (fullAsset.content ? "Y(" + fullAsset.content.toString().length + ")": "N"),
+              totalAssetsProcessed
+            );
+
+            /* ═══════════════════════════════════════════════════════
+               CONTENT EXTRACTION STRATEGY
+               ─────────────────────────────────────────────────────
+               Template-based emails:
+                 views.html.content  → only the CSS/template skeleton
+                 views.html.slots    → JSON structure with actual content
+                   └─ {slotKey}.blocks.{blockKey}.content → real HTML
+               The slots JSON is merged by SFMC's rendering engine at
+               send-time;  there are NO matching placeholders in the
+               skeleton HTML.  So we extract block content DIRECTLY.
+
+               Freeform/paste emails:
+                 views.html.content  → full HTML with all content
+                 views.html.slots    → empty / not present
+               ═══════════════════════════════════════════════════════ */
+
+            if (fullAsset.views && fullAsset.views.html) {
+              var htmlView = fullAsset.views.html;
+
+              /* ── 1. Collect ALL slot → block content ─────────────── */
+              var allBlockContent = "";
+              var slotCount = 0;
+
+              if (htmlView.slots) {
+                for (var slotKey in htmlView.slots) {
+                  if (htmlView.slots.hasOwnProperty(slotKey)) {
+                    slotCount++;
+                    var slotObj = htmlView.slots[slotKey
+                                        ];
+
+                    /* Each slot has a "blocks" object with content blocks */
+                    if (slotObj.blocks) {
+                      for (var blockKey in slotObj.blocks) {
+                        if (slotObj.blocks.hasOwnProperty(blockKey)) {
+                          var block = slotObj.blocks[blockKey
+                                                    ];
+
+                          /* block.content holds the actual HTML for this content block */
+                          if (block.content) {
+                            allBlockContent += block.content;
+                                                    }
+                                                    /* Some blocks store content in block.design (rich content) */
+                          if (!block.content && block.design) {
+                            allBlockContent += block.design;
+                                                    }
+                                                    /* Some blocks may have nested slots (stacked layouts) */
+                          if (block.slots) {
+                            for (var nestedSlotKey in block.slots) {
+                              if (block.slots.hasOwnProperty(nestedSlotKey)) {
+                                var nestedSlot = block.slots[nestedSlotKey
+                                                                ];
+                                if (nestedSlot.blocks) {
+                                  for (var nestedBlockKey in nestedSlot.blocks) {
+                                    if (nestedSlot.blocks.hasOwnProperty(nestedBlockKey)) {
+                                      var nestedBlock = nestedSlot.blocks[nestedBlockKey
+                                                                            ];
+                                      if (nestedBlock.content) {
+                                        allBlockContent += nestedBlock.content;
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                if (nestedSlot.content) {
+                                  allBlockContent += nestedSlot.content;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        /* Slot itself may have direct content (no blocks) */
+                    if (slotObj.content && !slotObj.blocks) {
+                      allBlockContent += slotObj.content;
+                                        }
+                                    }
+                                }
+                            }
+                            /* ── 2. Decide which content to use ──────────────────── */
+              if (slotCount > 0 && allBlockContent) {
+                                /* TEMPLATE-BASED email: use the actual block content.
+                   Wrap with the <style> section from the skeleton so
+                   the CSS styles are preserved. */
+                var styleBlock = "";
+                if (htmlView.content) {
+                  var styleStart = htmlView.content.indexOf("<style");
+                  if (styleStart > -1) {
+                    var styleEnd = htmlView.content.indexOf("</style>", styleStart);
+                    if (styleEnd > -1) {
+                      styleBlock = htmlView.content.substring(styleStart, styleEnd + 8);
+                                        }
+                                    }
+                                }
+                contentHtml = styleBlock + allBlockContent;
+                            } else if (htmlView.content) {
+                                /* FREEFORM email: views.html.content has everything */
+                contentHtml = htmlView.content;
+                            }
+                        }
+                        /* Fallback: preheader or direct content property */
+            if (!contentHtml || contentHtml === "") {
+              if (fullAsset.views && fullAsset.views.preheader && fullAsset.views.preheader.content) {
+                contentHtml = fullAsset.views.preheader.content;
+                            } else if (fullAsset.content) {
+                contentHtml = fullAsset.content;
+                            }
+                        }
+                    }
+                } catch (detailEx) {
+          writeLog("WARN",
+                    "DETAIL_FAIL",
+                    "Could not fetch full details for asset: " + assetName,
+                    "Error: " + Stringify(detailEx),
+            totalAssetsProcessed
+          );
+                }
+                /* Debug: log what was extracted for each asset */
+        var slotsFound = 0;
+        var blockDetails = "";
+        if (fullAsset && fullAsset.views && fullAsset.views.html && fullAsset.views.html.slots) {
+          for (var dbgKey in fullAsset.views.html.slots) {
+            if (fullAsset.views.html.slots.hasOwnProperty(dbgKey)) {
+              slotsFound++;
+              var dbgSlot = fullAsset.views.html.slots[dbgKey
+                            ];
+              blockDetails += "Slot[" + dbgKey + "]: ";
+
+              if (dbgSlot.blocks) {
+                for (var dbgBk in dbgSlot.blocks) {
+                  if (dbgSlot.blocks.hasOwnProperty(dbgBk)) {
+                    var dbgBlock = dbgSlot.blocks[dbgBk
+                                        ];
+                    var bProps = [];
+                    for (var bp in dbgBlock) {
+                      if (dbgBlock.hasOwnProperty(bp)) bProps.push(bp);
+                                        }
+                    blockDetails += "Block[" + dbgBk + "] props=(" + bProps.join(",") + ") ";
+                    blockDetails += "hasContent=" + (dbgBlock.content ? "Y(" + dbgBlock.content.toString().length + ")": "N") + " ";
+                    blockDetails += "hasSuperContent=" + (dbgBlock.superContent ? "Y": "N") + " ";
+                    blockDetails += "hasData=" + (dbgBlock.data ? "Y": "N") + " ";
+                                    }
+                                }
+                            } else {
+                blockDetails += "(no blocks obj) ";
+                            }
+              if (dbgSlot.content) blockDetails += "slotContent=Y(" + dbgSlot.content.toString().length + ") ";
+                        }
+                    }
+                }
+
+        writeLog("INFO",
+                "CONTENT_DEBUG",
+                "Asset: " + assetName + " | Type: " + (fullAsset ? (fullAsset.assetType ? fullAsset.assetType.name : "unknown") : "N/A"),
+                "Slots: " + slotsFound + " | ContentLen: " + (contentHtml ? contentHtml.length : 0) + " | " + blockDetails,
+          totalAssetsProcessed
+        );
+
+        /* Clean unwanted HTML entities before storing */
+        contentHtml = cleanHtmlEntities(contentHtml);
+
+        /* Truncate to 12000 chars (Content field must be nvarchar(max) in Email Studio) */
+        if (contentHtml && contentHtml.length > 12000) {
+          contentHtml = contentHtml.substring(0,
+                    12000);
+                }
+                /* ── STEP 4: Insert asset into Data DE ─────────────────────── */
+        insertAsset(assetName, assetId, customerKey, subject, contentHtml);
+        totalAssetsProcessed++;
+
+        writeLog("INFO",
+                "INSERT_OK",
+                "Inserted: " + assetName,
+                "ID=" + assetId + " | Key=" + customerKey + " | Subject=" + subject
+            + " | ModifiedDate=" + (fullAsset && fullAsset.modifiedDate ? fullAsset.modifiedDate : "N/A"),
+          totalAssetsProcessed
+        );
+            }
+            /* ── Pagination ───────────────────────────────────────────── */
+      if (currentPage * PAGE_SIZE >= totalCount) {
+        hasMorePages = false;
+            } else {
+        currentPage++;
+            }
+        }
+        /* ── STEP 5: WSProxy fallback for legacy Email objects ────────── */
+    var prox = new Script.Util.WSProxy();
+    var wsFilter = {
+      Property: "Name",
+      SimpleOperator: "like",
+      Value: SEARCH_PATTERN + "%"
+        };
+    var wsResult = prox.retrieve(
+      "Email",
+        [
+            "ID",
+            "Name",
+            "CustomerKey",
+            "Subject",
+            "HTMLBody",
+            "ModifiedDate"
+        ],
+      wsFilter
+    );
+
+    var wsCount = (wsResult && wsResult.Results) ? wsResult.Results.length : 0;
+    writeLog("INFO",
+        "WSPROXY_RESULT",
+        "WSProxy found " + wsCount + " legacy email(s).",
+        "N/A",
+        0);
+
+    if (wsCount > 0) {
+      for (var j = 0; j < wsResult.Results.length; j++) {
+        var em = wsResult.Results[j
+                ];
+
+        var emName        = em.Name        ? em.Name.toString()        : "";
+        var emId          = em.ID          ? em.ID.toString()          : "";
+        var emCustomerKey = em.CustomerKey ? em.CustomerKey.toString() : "";
+        var emSubject     = em.Subject     ? em.Subject.toString()     : "";
+        var emContent     = em.HTMLBody    ? em.HTMLBody.toString()    : "";
+
+        /* Clean unwanted HTML entities */
+        emContent = cleanHtmlEntities(emContent);
+
+        /* Truncate to 12000 chars (Content field must be nvarchar(max) in Email Studio) */
+        if (emContent && emContent.length > 12000) {
+          emContent = emContent.substring(0,
+                    12000);
+                }
+
+        insertAsset(emName, emId, emCustomerKey, emSubject, emContent);
+        totalAssetsProcessed++;
+
+        var emModDate = em.ModifiedDate ? em.ModifiedDate.toString() : "N/A";
+        writeLog("INFO",
+                "WSPROXY_INSERT",
+                "Legacy email inserted: " + emName,
+                "ID=" + emId + " | Key=" + emCustomerKey + " | ModifiedDate=" + emModDate,
+          totalAssetsProcessed
+        );
+            }
+        }
+        /* ── STEP 6: Final summary ───────────────────────────────────── */
+    writeLog("INFO",
+        "SCRIPT_COMPLETE",
+        "Finished. Total assets: " + totalAssetsProcessed,
+        "Run ID: " + runId,
+      totalAssetsProcessed
+    );
+    } catch (ex) {
+        /* Log the error, then re-throw so Automation shows FAILED */
+    try {
+      writeLog("ERROR",
+            "SCRIPT_FATAL",
+            "Script failed.",
+            "Error: " + Stringify(ex),
+            0);
+        } catch (logFail) {
+            /* nothing we can do */
+        }
+    throw ex;
+    }
+</script>
